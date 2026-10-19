@@ -1,0 +1,262 @@
+name: slot. for KONKR ARM64
+
+# Upstream's signed-release pipeline needs the author's signing secrets, so it is
+# manual-only in this fork. Use "Build Android APK (RPC fullscreen)" instead.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  arm64-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    env:
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+      ANDROID_HOME: /usr/local/lib/android/sdk
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Android SDK packages
+        run: |
+          # GitHub hosted ubuntu includes Android SDK command-line tools.
+          # setup-android@v3 currently tries to install removed "tools" package.
+          MANAGER="$(find "$ANDROID_SDK_ROOT/cmdline-tools" -maxdepth 3 -type f -name sdkmanager | sort -V | tail -1)"
+          if [ -z "$MANAGER" ]; then echo "Android sdkmanager not installed" >&2; exit 1; fi
+          # Google SDK's CDN occasionally returns a corrupt/truncated NDK ZIP.
+          # A fresh hosted runner cannot reuse a partial download, so retry
+          # the pinned NDK instead of failing a healthy source checkout.
+          for attempt in 1 2 3 4; do
+            if "$MANAGER" --sdk_root="$ANDROID_SDK_ROOT" --install "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018" \
+              && test -s "$ANDROID_SDK_ROOT/ndk/27.2.12479018/source.properties"; then
+              echo "Verified Android NDK r27c installed (attempt $attempt)"
+              break
+            fi
+            if [ "$attempt" -eq 4 ]; then
+              echo "::error::Android NDK 27.2 download failed after four attempts"
+              exit 1
+            fi
+            echo "::warning::Transient SDK/NDK download error, retry $attempt of 4"
+            sleep $((attempt * 5))
+          done
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          # Match rust-toolchain.toml (channel = "1.96") exactly.
+          # "1.96.0" and "1.96" can install into DISTINCT rustup homes;
+          # cargo reads the project's 1.96 override.
+          toolchain: '1.96'
+          targets: aarch64-linux-android
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Test native RetroAchievements evaluator and offline queue
+        run: cargo test -p slot-achievements -p slot-retro
+      - name: Test KONKR 3:2 scaling
+        run: cargo test -p slot-gfx --no-default-features --test konkr
+      - name: Test full-width Slot onboarding prompts
+        run: cargo test -p slot-ui --lib onboarding_tests
+      - name: Test original Slot v1.7 PNG and cartridge graphics
+        run: cargo test -p slot-ui --test cart_material --test upstream_v17_assets --test native_resolution --test insert_neighbour_motion --test mixed_shelf_parity --test chrome_crt_parity
+      - name: Export authentic Slot keycap graphics for Android Apps
+        run: |
+          cargo run --locked -p slot-ui --example export_apps_legend -- android/app/src/main/assets/apps_controls
+          test -s android/app/src/main/assets/apps_controls/move.png
+          test -s android/app/src/main/assets/apps_controls/open.png
+          test -s android/app/src/main/assets/apps_controls/back.png
+          python3 - <<'PY'
+          from pathlib import Path
+          import struct
+          for name in ('move', 'open', 'back'):
+              data = (Path('android/app/src/main/assets/apps_controls') / f'{name}.png').read_bytes()
+              assert data[:8] == bytes((137, 80, 78, 71, 13, 10, 26, 10))
+              width, height = struct.unpack('>II', data[16:24])
+              assert width > 20 and height == 24, (name, width, height)
+              print(f'Verified authentic Slot legend {name}: {width}x{height}')
+          PY
+      - name: Test Android library and shelf selection
+        run: cargo test -p slot-android --lib
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+      - name: Validate pinned speculative-audio patch scripts
+        run: python3 -m py_compile scripts/patch-mgba-speculative-audio.py scripts/patch-gpsp-speculative-audio.py
+      - name: Build mGBA arm64 libretro core
+        run: |
+          export ANDROID_NDK_HOME="$ANDROID_SDK_ROOT/ndk/27.2.12479018"
+          bash scripts/build-mgba-android.sh
+      - name: Build gpSP arm64 libretro core
+        run: |
+          export ANDROID_NDK_HOME="$ANDROID_SDK_ROOT/ndk/27.2.12479018"
+          bash scripts/build-gpsp-android.sh
+      - name: Checkout official Slot revision required by Cart Studio
+        uses: actions/checkout@v4
+        with:
+          repository: BrandonKowalski/slot
+          ref: 34ac38031fd903eb2a0a0157f1dea4d3a5546195
+          path: studio-upstream/slot
+
+      - name: Stage original Studio with its pinned upstream Slot sources
+        run: |
+          set -euo pipefail
+          cp -a third_party/slot-cart-studio studio-upstream/slot-cart-studio
+          # Isolate the pinned upstream Cargo project from our parent workspace.
+          # This edit affects the ephemeral CI copy only; vendored sources stay exact.
+          printf '\n[workspace]\n' >> studio-upstream/slot-cart-studio/Cargo.toml
+          test "$(tr -d '\r\n' < studio-upstream/slot-cart-studio/slot.ref)" = \
+               "$(git -C studio-upstream/slot rev-parse HEAD)"
+          node --test studio-upstream/slot-cart-studio/web/*.test.mjs
+
+      - name: Install wasm-pack and target for original Studio
+        run: |
+          rustup target add wasm32-unknown-unknown --toolchain 1.96.0
+          curl -fsSL https://github.com/wasm-bindgen/wasm-pack/releases/download/v0.15.0/wasm-pack-v0.15.0-x86_64-unknown-linux-musl.tar.gz \
+            | tar -xz -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/wasm-pack-v0.15.0-x86_64-unknown-linux-musl" >> "$GITHUB_PATH"
+
+      - name: Build and package genuine Cart Studio HTML/JS/WASM in APK assets
+        run: |
+          set -euo pipefail
+          (cd studio-upstream/slot-cart-studio && \
+            wasm-pack build --release --target web --no-typescript --out-dir web/pkg)
+          python3 scripts/package-konkr-cart-studio.py \
+            --source . --built studio-upstream/slot-cart-studio/web
+          test -s android/app/src/main/assets/studio/pkg/slot_cart_studio_bg.wasm
+
+      - name: Test Android debug and KONKR release policies on JVM
+        run: gradle --no-daemon -p android :app:testDebugUnitTest :app:testReleaseUnitTest
+      - name: Assemble signed KONKR ARM64 release
+        env:
+          SLOT_KEYSTORE_BASE64: ${{ secrets.SLOT_KEYSTORE_BASE64 }}
+          SLOT_SIGNING_STORE_PASSWORD: ${{ secrets.SLOT_SIGNING_STORE_PASSWORD }}
+          SLOT_SIGNING_KEY_ALIAS: ${{ secrets.SLOT_SIGNING_KEY_ALIAS }}
+          SLOT_SIGNING_KEY_PASSWORD: ${{ secrets.SLOT_SIGNING_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "$SLOT_KEYSTORE_BASE64" || { echo "::error::Configure permanent signing secrets"; exit 1; }
+          export SLOT_SIGNING_STORE_FILE="$RUNNER_TEMP/slot-konkr-signing.jks"
+          (umask 077; printf '%s' "$SLOT_KEYSTORE_BASE64" | base64 -d > "$SLOT_SIGNING_STORE_FILE")
+          export ANDROID_NDK_HOME="$ANDROID_SDK_ROOT/ndk/27.2.12479018"
+          bash scripts/build-konkr-android.sh
+          gradle --no-daemon -p android :app:assembleRelease
+      - name: Verify signed ARM64 APK and upgrade compatibility
+        run: |
+          set -euo pipefail
+          APK=android/app/build/outputs/apk/release/app-release.apk
+          test -s "$APK"
+          "$ANDROID_SDK_ROOT/build-tools/35.0.0/aapt" dump badging "$APK" > "$RUNNER_TEMP/konkr-badging.txt"
+          grep -F "package: name='fyi.slot.konkr' versionCode='120'" "$RUNNER_TEMP/konkr-badging.txt"
+          grep -F "versionName='1.2.1'" "$RUNNER_TEMP/konkr-badging.txt"
+          "$ANDROID_SDK_ROOT/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$APK" |
+            grep -Fi '4f42b8f0ac98f6a0102804ab51020ea0e7e2de7685c6ce09400a744de0b0fa2f'
+          for core in slot_android mgba_libretro gpsp_libretro; do
+            unzip -Z -1 "$APK" | grep -Fx "lib/arm64-v8a/lib${core}.so"
+          done
+          if unzip -Z -1 "$APK" | grep -Eq '^lib/(x86_64|x86|armeabi-v7a)/'; then
+            echo "::error::Non-KONKR ABI included in production APK"; exit 1
+          fi
+          unzip -Z -1 "$APK" | grep -Fx 'assets/studio/pkg/slot_cart_studio_bg.wasm'
+          # The signed KONKR APK must not contain AVD keyboard detection or
+          # isolated Multiplayer Lab storage behavior from src/debug.
+          unzip -Z -1 "$APK" | grep -Eq '^classes([0-9]+)?[.]dex$'
+          while IFS= read -r dex; do
+            if unzip -p "$APK" "$dex" | strings -a |
+                grep -E 'sdk_gphone|ranchu|goldfish|fyi[.]slot[.]konkr[.]lab|Multiplayer Lab:'; then
+              echo "::error::Found AVD / Multiplayer Lab test code in release DEX"
+              exit 1
+            fi
+          done < <(unzip -Z -1 "$APK" | grep -E '^classes([0-9]+)?[.]dex$')
+          sha256sum "$APK"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: slot-for-konkr-1.2.1-arm64-signed
+          path: android/app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: error
+
+  publish:
+    # Only the explicit release merge into main publishes a stable release.
+    # No beta, branch CI, manual run or tag push can publish this release.
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      startsWith(github.event.head_commit.message, 'release: slot. for KONKR Pocket Advance v1.2.1')
+    needs: arm64-apk
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: slot-for-konkr-1.2.1-arm64-signed
+          path: release-assets
+
+      - name: Validate, create GitHub-verified release commit, and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag=konkr-v1.2.1
+          file=slot-for-konkr-1.2.1-arm64.apk
+          test "$GITHUB_REF" = "refs/heads/main"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -s release-assets/app-release.apk
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::Release already exists; refusing to overwrite"
+            exit 1
+          fi
+          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" >/dev/null 2>&1; then
+            echo "::error::Release tag already exists; refusing to overwrite"
+            exit 1
+          fi
+          mv release-assets/app-release.apk "release-assets/$file"
+          (cd release-assets && sha256sum "$file" > SHA256SUMS.txt)
+          (cd release-assets && sha256sum -c SHA256SUMS.txt)
+
+          # As in v1.1.0: create a no-source-change GitHub-signed commit,
+          # then verify GitHub's signature BEFORE tagging or publishing.
+          current="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)"
+          test "$current" = "$GITHUB_SHA" || {
+            echo "::error::main moved during release; abort"; exit 1;
+          }
+          tree="$(git rev-parse 'HEAD^{tree}')"
+          jq -nc --arg tree "$tree" --arg parent "$GITHUB_SHA" \
+            --arg message "chore: signed v1.2.1 release reference" \
+            '{message:$message,tree:$tree,parents:[$parent]}' \
+            | gh api --method POST "repos/$GITHUB_REPOSITORY/git/commits" --input - \
+            > "$RUNNER_TEMP/signed-commit.json"
+          verified="$(jq -r '.verification.verified' "$RUNNER_TEMP/signed-commit.json")"
+          sha="$(jq -r '.sha' "$RUNNER_TEMP/signed-commit.json")"
+          test "$verified" = true || {
+            echo "::error::GitHub did not verify release commit; release not published"
+            exit 1
+          }
+          test "$(gh api "repos/$GITHUB_REPOSITORY/git/commits/$sha" --jq '.verification.verified')" = true
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/git/refs/heads/main" \
+            -f sha="$sha" -F force=false >/dev/null
+          test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)" = "$sha"
+          gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+            -f ref="refs/tags/$tag" -f sha="$sha" >/dev/null
+          test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --jq .object.sha)" = "$sha"
+
+          gh release create "$tag" "release-assets/$file" release-assets/SHA256SUMS.txt \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --latest \
+            --title "slot. for KONKR Pocket Advance v1.2.1" \
+            --notes-file RELEASE-NOTES.md
+
+          gh release view "$tag" --repo "$GITHUB_REPOSITORY" \
+            --json name,isDraft,isPrerelease,tagName,assets,url \
+            | tee "$RUNNER_TEMP/release-result.json"
+          jq -e --arg tag "$tag" --arg apk "$file" \
+            '.tagName == $tag and (.isDraft == false) and (.isPrerelease == false) and
+             ([.assets[].name] | index($apk) != null and index("SHA256SUMS.txt") != null)' \
+            "$RUNNER_TEMP/release-result.json"
+          mkdir -p "$RUNNER_TEMP/check-published-assets"
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" \
+            --dir "$RUNNER_TEMP/check-published-assets"
+          (cd "$RUNNER_TEMP/check-published-assets" && sha256sum -c SHA256SUMS.txt)
+          echo "Published stable verified v1.2.1 tag at $sha"

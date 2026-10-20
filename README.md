@@ -1,12 +1,12 @@
 <p align="center"><img src=".github/resources/slot-for-konkr-hero.png" alt="slot. for KONKR Pocket Advance — Android port running on a blue KONKR Pocket Advance" width="100%"></p>
 
-# slot. for KONKR Pocket Advance
+# slot. for Everyone Android Port
 
-*An unofficial Android port of [slot.](https://slot-cfw.fyi/#hero), made for the KONKR Pocket Advance.*
+*An unofficial Android port of [slot.](https://slot-cfw.fyi/#hero), made for the Everyone.*
 
-## Why I made this port
+## Why I made this port (Original Port made by - https://github.com/Baggio94/slot-for-kpa )
 
-When I watched [Russ from Retro Game Corps showcase slot.](https://www.youtube.com/watch?v=vndbnpH0QoE&t=1167s), I immediately thought: *this would be perfect for the KONKR Pocket Advance.*
+When I watched [Russ from Retro Game Corps showcase slot.](https://www.youtube.com/watch?v=vndbnpH0QoE&t=1167s), I immediately thought: *this would be perfect for the KONKR Pocket Advance. (and i thought why only konkr? lets put it everywhere*
 
 So I decided to bring slot. to Android, adding a few extra features along the way while staying true to the simplicity, charm, and philosophy of the original experience.
 

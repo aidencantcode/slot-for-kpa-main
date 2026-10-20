@@ -1,21 +1,36 @@
 use std::ffi::c_void;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 
 pub const OUT_W: u32 = 720;
 pub const OUT_H: u32 = 480;
 
-// When set, the 720x480 composite is stretched over the whole panel whatever
-// its aspect ratio (e.g. a 4:3 Retroid Pocket Classic at 1280x960). The Android
-// build turns this on; other hosts keep the original fit/bezel placement.
-static FILL_PANEL: AtomicBool = AtomicBool::new(false);
-
-pub fn set_fill_panel(on: bool) {
-    FILL_PANEL.store(on, Ordering::Relaxed);
+/// How the 720x480 composite is placed on the physical panel.
+/// `Original` keeps the upstream integer/bezel placement (desktop and device
+/// builds). The Android build selects one of the others every frame:
+/// `Fill` stretches to the whole panel, `Fit` keeps 3:2 with black bars, and
+/// `Integer` uses the largest whole multiple of the native 240x160 picture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PanelLayout {
+    Original,
+    Fill,
+    Fit,
+    Integer,
 }
 
-pub fn fill_panel() -> bool {
-    FILL_PANEL.load(Ordering::Relaxed)
+static PANEL_LAYOUT: AtomicU8 = AtomicU8::new(0);
+
+pub fn set_panel_layout(layout: PanelLayout) {
+    PANEL_LAYOUT.store(layout as u8, Ordering::Relaxed);
+}
+
+pub fn panel_layout() -> PanelLayout {
+    match PANEL_LAYOUT.load(Ordering::Relaxed) {
+        1 => PanelLayout::Fill,
+        2 => PanelLayout::Fit,
+        3 => PanelLayout::Integer,
+        _ => PanelLayout::Original,
+    }
 }
 
 #[derive(Debug)]
@@ -68,9 +83,26 @@ pub fn blit_rect_fit(panel: (u32, u32), shake: f32) -> (i32, i32, i32, i32) {
 }
 
 pub fn blit_rect(window: (u32, u32), shake: f32) -> (i32, i32, i32, i32) {
-    if fill_panel() && window.0 > 0 && window.1 > 0 {
-        let dx = shake * window.0 as f32 / OUT_W as f32;
-        return (dx.round() as i32, 0, window.0 as i32, window.1 as i32);
+    if window.0 > 0 && window.1 > 0 {
+        match panel_layout() {
+            PanelLayout::Original => {}
+            PanelLayout::Fill => {
+                let dx = shake * window.0 as f32 / OUT_W as f32;
+                return (dx.round() as i32, 0, window.0 as i32, window.1 as i32);
+            }
+            PanelLayout::Fit => return blit_rect_fit(window, shake),
+            PanelLayout::Integer => {
+                let k = (window.0 / 240).min(window.1 / 160).max(1) as i32;
+                let (w, h) = (240 * k, 160 * k);
+                let dx = (shake * k as f32 / 3.0).round() as i32;
+                return (
+                    (window.0 as i32 - w) / 2 + dx,
+                    (window.1 as i32 - h) / 2,
+                    w,
+                    h,
+                );
+            }
+        }
     }
     if crate::bezel::framed(window) {
         let (x, y, w, h) = crate::bezel::screen_rect(window);

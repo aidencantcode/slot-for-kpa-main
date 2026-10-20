@@ -262,7 +262,8 @@ impl Compositor {
     }
 
     pub fn end_frame(&mut self, window: (u32, u32)) {
-        let framed = !crate::surface::fill_panel() && crate::bezel::framed(window);
+        let framed = crate::surface::panel_layout() == crate::surface::PanelLayout::Original
+            && crate::bezel::framed(window);
         let (x, mut y, w, h) = blit_rect(window, self.shake);
         let drop = if framed {
             crate::bezel::lifted_rect(window, self.lift).1

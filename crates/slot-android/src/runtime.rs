@@ -169,6 +169,13 @@ fn queue_ra_notice(queue: &mut VecDeque<String>, payload: String) {
 static PATHS: Mutex<Option<(PathBuf, PathBuf)>> = Mutex::new(None);
 static AUDIO: Mutex<VecDeque<i16>> = Mutex::new(VecDeque::new());
 static PLAYING: AtomicBool = AtomicBool::new(false);
+// Physical key for each Controls slot (see settings::PAD_LOGICAL); empty means
+// the default layout. Read by the JNI key entry point, which runs off the GL
+// thread, so it lives outside the engine.
+static PAD_MAP: Mutex<Vec<i32>> = Mutex::new(Vec::new());
+fn sync_pad_map(map: &[i32]) {
+    *PAD_MAP.lock().unwrap_or_else(|e| e.into_inner()) = map.to_vec();
+}
 static SAMPLE_RATE: AtomicI32 = AtomicI32::new(0);
 static DISPLAY_SYNC: AtomicBool = AtomicBool::new(false);
 // Updated by the GL owner after an entirely settled, fully preloaded shelf frame.
@@ -340,6 +347,7 @@ enum ShelfOverlay {
     GameplaySettings { row: usize },
     EmulationSettings { row: usize },
     InterfaceSettings { row: usize },
+    Controls { row: usize },
     GeneralSettings { row: usize },
     // Pause submenus never mutate the global Settings object.
     PauseSettings { row: usize },
@@ -355,7 +363,7 @@ enum ShelfOverlay {
     States,
 }
 
-const MENU_TEXT: [&str; 117] = [
+const MENU_TEXT: [&str; 131] = [
     "MENU",                             // 0
     "Library",                          // 1
     "Cart Studio",                      // 2
@@ -473,7 +481,26 @@ const MENU_TEXT: [&str; 117] = [
     "DOWNLOADING...",                    // 114
     "AVAILABLE",                         // 115
     "Time Format",                       // 116, Its-TroyM PR #2
+    "Controls",                          // 117
+    "CONTROLS",                          // 118
+    "A Button",                          // 119
+    "B Button",                          // 120
+    "L Button",                          // 121
+    "R Button",                          // 122
+    "Start Button",                      // 123
+    "Select Button",                     // 124
+    "X Button",                          // 125
+    "Y Button",                          // 126
+    "Menu (slot. cap)",                  // 127
+    "Reset Controls",                    // 128
+    "Aspect Ratio",                      // 129
+    "Integer Scaling",                   // 130
 ];
+
+/// Controls menu rows: A, B, L, R, Start, Select, X, Y, Fast Forward, Rewind,
+/// Menu, then the reset action. Six rows are visible at a time.
+const CONTROL_ROWS: [usize; 12] = [119, 120, 121, 122, 123, 124, 125, 126, 27, 37, 127, 128];
+fn controls_start(row: usize) -> usize { row.saturating_sub(5).min(6) }
 
 const INTERFACE_ROWS: [usize; 4] = [63, 64, 65, 116];
 const INTERFACE_KEYS: [usize; 4] = [13, 14, 15, 28];
@@ -580,6 +607,7 @@ struct Engine {
     slot_light_faces: (slot_gfx::TexId, slot_gfx::TexId),
     gb_bezel_tex: slot_gfx::TexId,
     gbc_bezel_tex: slot_gfx::TexId,
+    controls_capture: Option<(usize, Instant)>,
     custom_wallpaper_present: bool,
     setting_values: Vec<(slot_gfx::TexId, u32, u32)>,
     setting_carets: [(slot_gfx::TexId, u32, u32); 2],
@@ -696,8 +724,9 @@ fn wallpaper_pixels(root: Option<&Path>, selection: &crate::settings::WallpaperP
 impl Engine {
     fn new(library_version: u64, library: Option<&[RomEntry]>) -> Result<Self, String> {
         let size = (960, 640);
-        // Fill the whole panel on any aspect ratio (4:3 Retroid, 16:9, ...).
-        slot_gfx::set_fill_panel(true);
+        // Menus keep their 3:2 proportions on any panel; games pick their own
+        // layout (3:2 / Full screen / Integer) every frame.
+        slot_gfx::set_panel_layout(slot_gfx::PanelLayout::Fit);
         let mut gpu = Compositor::new(&AndroidSurface { size }).map_err(|e| e.to_string())?;
         let settings = PATHS.lock().unwrap_or_else(|e| e.into_inner())
             .as_ref().map(|(root, _)| Settings::load(root))
@@ -706,6 +735,7 @@ impl Engine {
         // Disable the dev13 approximate GPU grade to avoid double correction.
         gpu.set_colour_correction(false);
         FF_AUDIO_ENABLED.store(settings.ff_sound, Ordering::Release);
+        sync_pad_map(&settings.pad_map);
         let visuals_root = PATHS.lock().unwrap_or_else(|e| e.into_inner())
             .as_ref().map(|(root, _)| root.clone());
         if let Some(root) = visuals_root.as_deref() {
@@ -928,7 +958,10 @@ impl Engine {
                               "Dark", "Light", "Low", "Medium", "High", "Custom",
                                "LCD Grid V2", "Grid V2 + GBA Color", "zfast LCD",
                                "LCD1x", "Simpletex + GBA", "AGB-001",
-                               "AGS-001", "Sharp Bilinear", "12 HR", "24 HR"]
+                               "AGS-001", "Sharp Bilinear", "12 HR", "24 HR",
+                               "3:2", "Full Screen",
+                               "A", "B", "X", "Y", "L1", "R1", "L2", "R2",
+                               "L3", "START", "SELECT", "MENU", "PRESS KEY"]
             .into_iter().map(|value| {
                 let face = quick_value_face(value, true);
                 let tex = gpu.create_texture(face.w, face.h, &face.rgba);
@@ -1088,6 +1121,7 @@ impl Engine {
             slot_light_faces,
             gb_bezel_tex,
             gbc_bezel_tex,
+            controls_capture: None,
             custom_wallpaper_present,
             setting_values,
             setting_carets,
@@ -2046,6 +2080,20 @@ impl Engine {
                 }
             }
             Input::Key(code, pressed) => {
+                // Controls menu: the next physical key press is bound to the
+                // selected slot. The D-pad cancels; the menu is not remapped.
+                if let Some((slot, _)) = self.controls_capture {
+                    if pressed {
+                        if matches!(code, 19..=22) {
+                            self.controls_capture = None;
+                        } else if crate::settings::PAD_PHYSICAL.contains(&code) {
+                            self.settings.pad_assign(slot, code);
+                            self.controls_capture = None;
+                            self.persist_settings();
+                        }
+                    }
+                    return;
+                }
                 if matches!(code, 19 | 20) {
                     if !pressed {
                         if self.menu_held.is_some_and(|(held,_,_)|held==code) {
@@ -2590,7 +2638,7 @@ impl Engine {
                             },
                             ShelfOverlay::Settings { row } => match code {
                                 19 | 20 => self.overlay = ShelfOverlay::Settings {
-                                    row: move_menu_row(row, code, 5),
+                                    row: move_menu_row(row, code, 6),
                                 },
                                 96 => match row {
                                     0 => self.overlay = ShelfOverlay::GeneralSettings { row: 0 },
@@ -2598,9 +2646,26 @@ impl Engine {
                                     2 => self.overlay = ShelfOverlay::GameplaySettings { row: 0 },
                                     3 => self.overlay = ShelfOverlay::EmulationSettings { row: 0 },
                                     4 => self.overlay = ShelfOverlay::InterfaceSettings { row: 0 },
+                                    5 => self.overlay = ShelfOverlay::Controls { row: 0 },
                                     _ => return,
                                 },
                                 97 => self.overlay = ShelfOverlay::Menu { row: 4 },
+                                108 => self.overlay = ShelfOverlay::None,
+                                _ => {}
+                            },
+                            ShelfOverlay::Controls { row } => match code {
+                                19 | 20 => self.overlay = ShelfOverlay::Controls {
+                                    row: move_menu_row(row, code, CONTROL_ROWS.len()),
+                                },
+                                96 => {
+                                    if row + 1 < CONTROL_ROWS.len() {
+                                        self.controls_capture = Some((row, Instant::now()));
+                                    } else {
+                                        self.settings.pad_reset();
+                                        self.persist_settings();
+                                    }
+                                },
+                                97 => self.overlay = ShelfOverlay::Settings { row: 5 },
                                 108 => self.overlay = ShelfOverlay::None,
                                 _ => {}
                             },
@@ -3220,6 +3285,17 @@ impl Engine {
 
     /// Native 3:2 KONKR: GBA fills the panel and has no forced letterbox bezel.
     /// GB/GBC preserve the official 720×480 transparent overlays.
+    /// How the game picture (and its HUD) is placed on the panel: integer
+    /// scaling wins, otherwise Full screen stretches and 3:2 keeps the ratio.
+    fn game_layout(&self) -> slot_gfx::PanelLayout {
+        let platform = self.current_cart_platform();
+        let view = self.game_settings();
+        if view.integer_for(platform) { slot_gfx::PanelLayout::Integer }
+        else if view.aspect_for(platform) == crate::settings::ScreenAspect::Full {
+            slot_gfx::PanelLayout::Fill
+        } else { slot_gfx::PanelLayout::Fit }
+    }
+
     fn game_bezel(&self) -> Option<slot_gfx::TexId> {
         if self.game_settings().bezel_for(self.current_cart_platform())
             == crate::settings::Bezel::None {return None;}
@@ -3234,16 +3310,16 @@ impl Engine {
         match platform {
             // Upstream v1.7 hides GBA bezel on an unframed 3:2 panel:
             // GBA already fills KONKR's native 960x640 display.
-            Platform::Gba=>&[34,29],
-            Platform::Gbc=>&[88,29,90],
-            Platform::Gb=>&[89,29,36,90],
+            Platform::Gba=>&[34,29,129,130],
+            Platform::Gbc=>&[88,29,90,129,130],
+            Platform::Gb=>&[89,29,36,90,129,130],
         }
     }
     fn screen_keys(platform:Platform)-> &'static [usize] {
         match platform {
-            Platform::Gba=>&[0,22],
-            Platform::Gbc=>&[21,23,26],
-            Platform::Gb=>&[1,24,3,27],
+            Platform::Gba=>&[0,22,29,32],
+            Platform::Gbc=>&[21,23,26,30,33],
+            Platform::Gb=>&[1,24,3,27,31,34],
         }
     }
     fn screen_title(platform:Platform)->usize {
@@ -3260,7 +3336,7 @@ impl Engine {
     fn pause_screen_rows(&self) -> &'static [usize] {
         if self.current_cart_platform()==Platform::Gb &&
             !self.game.as_ref().is_some_and(GameSession::can_change_gb_palette) {
-            &[89,29,90]
+            &[89,29,90,129,130]
         } else {
             Self::screen_rows(self.current_cart_platform())
         }
@@ -3268,7 +3344,7 @@ impl Engine {
     fn pause_screen_key(&self,row:usize)->Option<usize> {
         if self.current_cart_platform()==Platform::Gb &&
             !self.game.as_ref().is_some_and(GameSession::can_change_gb_palette) {
-            [1,24,27].get(row).copied()
+            [1,24,27,31,34].get(row).copied()
         } else {
             Self::screen_keys(self.current_cart_platform()).get(row).copied()
         }
@@ -3325,7 +3401,7 @@ impl Engine {
         let relaunch=self.game.as_ref().is_some_and(GameSession::requires_relaunch);
         // Shader and color-correction are display-only and safe while linked;
         // never change input, save states, emulation speed or rewind in Link.
-        if relaunch || (linked && !matches!(key,0|1|2|21|22|23|24|25|26|27)) {
+        if relaunch || (linked && !matches!(key,0|1|2|21|22|23|24|25|26|27|29|30|31|32|33|34)) {
             set_message("Gameplay changes are disabled during Multiplayer".into());
             return;
         }
@@ -3436,6 +3512,7 @@ impl Engine {
         AUDIO.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
     fn persist_settings(&self) {
+        sync_pad_map(&self.settings.pad_map);
         if let Some((root, _)) = PATHS.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
             if let Err(error) = self.settings.save(root) {
                 set_message(format!("Cannot save Settings: {error}"));
@@ -3783,6 +3860,21 @@ impl Engine {
             27 => if scoped.bezel_gb==crate::settings::Bezel::None {17}else{19},
             28 => if self.settings.time_format==crate::settings::TimeFormat::TwelveHour
                 {35}else{36},
+            29 => if scoped.aspect_gba==crate::settings::ScreenAspect::Ratio32 {37}else{38},
+            30 => if scoped.aspect_gbc==crate::settings::ScreenAspect::Ratio32 {37}else{38},
+            31 => if scoped.aspect_gb==crate::settings::ScreenAspect::Ratio32 {37}else{38},
+            32 => if scoped.integer_gba {4}else{5},
+            33 => if scoped.integer_gbc {4}else{5},
+            34 => if scoped.integer_gb {4}else{5},
+            40..=50 => {
+                let index=key-40;
+                if matches!(self.controls_capture,Some((slot,_)) if slot==index) { 51 }
+                else {
+                    let physical=self.settings.pad_physical(index);
+                    39+crate::settings::PAD_PHYSICAL.iter()
+                        .position(|&p|p==physical).unwrap_or(0)
+                }
+            },
             _ => 5,
         }
     }
@@ -3812,7 +3904,8 @@ impl Engine {
     fn draw_setting_values(&self, row: usize, keys: &[usize], out: &mut Vec<Draw>) {
         let top = settings_row_top(keys.len());
         for (index, key) in keys.iter().copied().enumerate() {
-            if key > 28 { continue; } // Action-only rows have no value.
+            // Action-only rows have no value.
+            if key > 28 && !(29..=34).contains(&key) && !(40..=50).contains(&key) { continue; }
             let (tex, width, height) =
                 if key == 16 && matches!(self.settings.wallpaper,
                     crate::settings::WallpaperPick::File(_)) {
@@ -4007,7 +4100,7 @@ impl Engine {
                 self.draw_library_share_value(row, out);
             }
             ShelfOverlay::Settings { row } => {
-                self.draw_original_style_menu(26, &[81, 32, 33, 49, 58], row, out);
+                self.draw_original_style_menu(26, &[81, 32, 33, 49, 58, 117], row, out);
             }
             ShelfOverlay::GeneralSettings { row } => {
                 let rows=self.general_rows();
@@ -4016,6 +4109,13 @@ impl Engine {
                     83=>16,84=>17,85=>18,86=>19,87=>20,_=>usize::MAX
                 }).collect();
                 self.draw_setting_values(row,&keys,out);
+            }
+            ShelfOverlay::Controls { row } => {
+                let start = controls_start(row);
+                let end = (start + 6).min(CONTROL_ROWS.len());
+                self.draw_original_style_menu(118, &CONTROL_ROWS[start..end], row - start, out);
+                let keys: Vec<usize> = (start..end).map(|i| 40 + i).collect();
+                self.draw_setting_values(row - start, &keys, out);
             }
             ShelfOverlay::InterfaceSettings { row } => {
                 self.draw_original_style_menu(59, &INTERFACE_ROWS, row, out);
@@ -4399,6 +4499,9 @@ impl Engine {
             self.picker = None;
             self.overlay = ShelfOverlay::None;
         }
+        if self.controls_capture.is_some_and(|(_, at)| at.elapsed().as_secs() >= 8) {
+            self.controls_capture = None;
+        }
         // Update full-screen menus and spring-smooth the selection bar.
         // Keep animation entirely in rendering: never delay controller input.
         let (kind, selected, count) = match self.overlay {
@@ -4412,7 +4515,8 @@ impl Engine {
                 (14u8, row, self.pause_screen_rows().len()),
             ShelfOverlay::PauseGameplaySettings { row } => (15u8, row, 6usize),
             ShelfOverlay::Multiplayer => (11u8, 0, 0usize),
-            ShelfOverlay::Settings { row } => (4u8, row, 5usize),
+            ShelfOverlay::Settings { row } => (4u8, row, 6usize),
+            ShelfOverlay::Controls { row } => (18u8, row - controls_start(row), 6usize),
             ShelfOverlay::GeneralSettings { row } =>
                 (12u8, row, self.general_rows().len()),
             ShelfOverlay::About { row } => (17u8, row, 2usize),
@@ -4468,6 +4572,7 @@ impl Engine {
                     commands.push(Draw::Game);
                 }
             }
+            slot_gfx::set_panel_layout(self.game_layout());
             self.gpu.fit(self.size);
             self.gpu.begin_frame();
             self.gpu.draw_list(&commands);
@@ -4554,6 +4659,7 @@ impl Engine {
                     .then_some("undo"));
                 p.draw(None, Printed::default(), None, Printed::default(), &mut commands);
             }
+            slot_gfx::set_panel_layout(slot_gfx::PanelLayout::Fit);
             self.gpu.fit(self.size);
             self.gpu.begin_frame();
             self.gpu.draw_list(&commands);
@@ -4620,6 +4726,7 @@ impl Engine {
             if matches!(self.overlay, ShelfOverlay::Multiplayer) {
                 self.hud.draw(self.born.elapsed().as_millis() as u64, &mut commands);
             }
+            slot_gfx::set_panel_layout(slot_gfx::PanelLayout::Fit);
             self.gpu.fit(self.size);
             self.gpu.begin_frame();
             self.gpu.draw_list(&commands);
@@ -4635,6 +4742,7 @@ impl Engine {
         }
         let profile = self.current_emulation();
         let bezel=self.game_bezel(); // resolved before mutably borrowing GameSession
+        let layout=self.game_layout();
         let live=self.live_game_options(); // Copy, zero allocations on 60/120Hz callback
         FF_AUDIO_ENABLED.store(live.ff_sound,Ordering::Release);
         // Android's frame callback changes GLSurfaceView renderMode only when
@@ -4785,6 +4893,7 @@ impl Engine {
                     Ordering::Release,
                 );
             }
+            slot_gfx::set_panel_layout(layout);
             self.gpu.fit(self.size);
             self.gpu.begin_frame();
             let mut commands = Vec::new();
@@ -5051,6 +5160,7 @@ impl Engine {
                 self.clock_face,self.shelf_footer_ink(),&mut commands);
         }
         SHELF_INDICATOR_FLAGS.store(indicator_flags, Ordering::Release);
+        slot_gfx::set_panel_layout(slot_gfx::PanelLayout::Fit);
         self.gpu.fit(self.size);
         self.gpu.begin_frame();
         self.gpu.draw_list(&commands);
@@ -5354,10 +5464,10 @@ mod ui_feedback_tests {
 
     #[test]
     fn gba_three_two_screen_hides_no_op_bezel_but_keeps_gb_gbc() {
-        assert_eq!(Engine::screen_rows(Platform::Gba), &[34,29]);
-        assert_eq!(Engine::screen_keys(Platform::Gba), &[0,22]);
-        assert_eq!(Engine::screen_rows(Platform::Gbc), &[88,29,90]);
-        assert_eq!(Engine::screen_rows(Platform::Gb), &[89,29,36,90]);
+        assert_eq!(Engine::screen_rows(Platform::Gba), &[34,29,129,130]);
+        assert_eq!(Engine::screen_keys(Platform::Gba), &[0,22,29,32]);
+        assert_eq!(Engine::screen_rows(Platform::Gbc), &[88,29,90,129,130]);
+        assert_eq!(Engine::screen_rows(Platform::Gb), &[89,29,36,90,129,130]);
     }
     #[test]
     fn ordinary_cart_scrolling_does_not_restart_name_fade() {
@@ -5961,6 +6071,15 @@ pub extern "system" fn Java_fyi_slot_konkr_MainActivity_nativeKey(
     key: i32,
     pressed: u8,
 ) {
+    // Controls menu: while a game is running, physical keys are translated
+    // through the user's mapping. The shelf and menus always use the default.
+    let key = if PLAYING.load(Ordering::Acquire) {
+        let map = PAD_MAP.lock().unwrap_or_else(|e| e.into_inner());
+        match crate::settings::pad_translate(&map, key) {
+            Some(mapped) => mapped,
+            None => return,
+        }
+    } else { key };
     INPUT
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())

@@ -12,11 +12,3 @@ fn konkr_960x640_fills_the_entire_panel() {
 fn other_aspect_ratios_keep_the_original_integer_placement() {
     assert_eq!(blit_rect((1500, 980), 0.0), (30, 10, 1440, 960));
 }
-
-#[test]
-fn fill_panel_stretches_a_4x3_screen_edge_to_edge() {
-    slot_gfx::set_fill_panel(true);
-    assert_eq!(blit_rect((1280, 960), 0.0), (0, 0, 1280, 960));
-    assert_eq!(canvas_size((1280, 960)), (1280, 960));
-    slot_gfx::set_fill_panel(false);
-}

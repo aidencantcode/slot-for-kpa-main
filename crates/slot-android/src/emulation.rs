@@ -1,7 +1,7 @@
 //! Per-cartridge opt-in latency profiles. Never touch the ROM or RetroArch saves.
 use std::{fs, io, path::{Path, PathBuf}};
 use serde::{Deserialize, Serialize};
-use crate::{core_selection, settings::{self, Settings, Shader, Bezel}};
+use crate::{core_selection, settings::{self, Settings, Shader, Bezel, ScreenAspect}};
 use slot_store::{Core, Platform};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -18,6 +18,8 @@ pub struct EmulationProfile {
     // global preference until this specific ROM+core is edited.
     pub screen_shader: Option<Shader>,
     pub screen_bezel: Option<Bezel>,
+    pub screen_aspect: Option<ScreenAspect>,
+    pub screen_integer: Option<bool>,
     pub colour_correction_override: Option<bool>,
     pub gb_palettes_override: Option<bool>,
     pub ff_speed_override: Option<u8>,
@@ -33,6 +35,7 @@ impl Default for EmulationProfile {
             responsive_pacing: false, display_sync_pacing: false,
             run_ahead_frames: 0,
             screen_shader: None, screen_bezel: None,
+            screen_aspect: None, screen_integer: None,
             colour_correction_override: None,
             gb_palettes_override: None, ff_speed_override: None,
             ff_sound_override: None, rewind_override: None,
@@ -48,6 +51,7 @@ impl EmulationProfile {
             display_sync_pacing: settings.display_sync_pacing,
             run_ahead_frames: settings.run_ahead_frames,
             screen_shader: None, screen_bezel: None,
+            screen_aspect: None, screen_integer: None,
             colour_correction_override: None,
             gb_palettes_override: None, ff_speed_override: None,
             ff_sound_override: None, rewind_override: None,
@@ -69,6 +73,8 @@ impl EmulationProfile {
             settings.set_colour_for(platform,value);
         }
         if let Some(value)=self.screen_bezel {settings.set_bezel_for(platform,value);}
+        if let Some(value)=self.screen_aspect {settings.set_aspect_for(platform,value);}
+        if let Some(value)=self.screen_integer {settings.set_integer_for(platform,value);}
         if let Some(value)=self.gb_palettes_override { settings.gb_palettes=value; }
         if let Some(value)=self.ff_speed_override { settings.ff_speed=value; }
         if let Some(value)=self.ff_sound_override { settings.ff_sound=value; }
@@ -96,6 +102,12 @@ impl EmulationProfile {
             (_,25|26|27)=>match platform {
                 Platform::Gba=>25,Platform::Gbc=>26,Platform::Gb=>27
             },
+            (_,29|30|31)=>match platform {
+                Platform::Gba=>29,Platform::Gbc=>30,Platform::Gb=>31
+            },
+            (_,32|33|34)=>match platform {
+                Platform::Gba=>32,Platform::Gbc=>33,Platform::Gb=>34
+            },
             _=>key,
         };
         if !view.change(actual_key,right) { return false; }
@@ -106,6 +118,8 @@ impl EmulationProfile {
                 self.screen_shader=Some(view.shader_for(platform)),
             2 => self.colour_correction_override=Some(view.colour_for(platform)),
             25 | 26 | 27 => self.screen_bezel=Some(view.bezel_for(platform)),
+            29 | 30 | 31 => self.screen_aspect=Some(view.aspect_for(platform)),
+            32 | 33 | 34 => self.screen_integer=Some(view.integer_for(platform)),
             3 if platform==Platform::Gb =>
                 self.gb_palettes_override=Some(view.gb_palettes),
             4 => self.ff_speed_override=Some(view.ff_speed),

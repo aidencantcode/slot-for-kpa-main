@@ -110,6 +110,33 @@ impl Bezel {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all="snake_case")]
+pub enum ScreenAspect { Ratio32, Full }
+impl Default for ScreenAspect {fn default()->Self {Self::Full}}
+impl ScreenAspect {
+    pub fn step(self)->Self {
+        match self {Self::Ratio32=>Self::Full,Self::Full=>Self::Ratio32}
+    }
+}
+
+/// Logical buttons the Controls menu can rebind, in menu order:
+/// A, B, L, R, START, SELECT, X (turbo A), Y (turbo B), R2 (fast-forward),
+/// L2 (rewind), MENU (slot. cap). Values are Android key codes.
+pub const PAD_LOGICAL: [i32; 11] = [96, 97, 102, 103, 108, 109, 99, 100, 105, 104, 110];
+/// Physical keys that can be assigned (the logical set plus L3).
+pub const PAD_PHYSICAL: [i32; 12] = [96, 97, 99, 100, 102, 103, 104, 105, 106, 108, 109, 110];
+
+/// Translate a physical Android key code into the logical code the engine
+/// understands. `None` means the key is currently unassigned.
+pub fn pad_translate(map: &[i32], physical: i32) -> Option<i32> {
+    if map.len() != PAD_LOGICAL.len() { return Some(physical); }
+    if let Some(index) = map.iter().position(|&p| p == physical) {
+        return Some(PAD_LOGICAL[index]);
+    }
+    if PAD_LOGICAL.contains(&physical) { None } else { Some(physical) }
+}
+
 pub const SPEEDS: [u8; 4] = [2, 3, 4, 6];
 const NAME: &str = "slot-konkr-settings.json";
 
@@ -174,6 +201,12 @@ pub struct Settings {
     pub colour_correction_gb: bool,
     pub colour_correction_gbc: bool,
     pub bezel_gba: Bezel, pub bezel_gbc: Bezel, pub bezel_gb: Bezel,
+    // 3:2 or Full screen, and optional integer scaling, per system.
+    pub aspect_gba: ScreenAspect, pub aspect_gbc: ScreenAspect,
+    pub aspect_gb: ScreenAspect,
+    pub integer_gba: bool, pub integer_gbc: bool, pub integer_gb: bool,
+    // Controls menu: physical key for each PAD_LOGICAL slot; empty = default.
+    pub pad_map: Vec<i32>,
     pub gb_palettes: bool, pub gb_palette: u8, pub rewind: bool,
     // X/Y Buttons: true = Slot's original Turbo, false = Y=A and X=B.
     // Existing persisted turbo=false now selects the alternative A/B mapping.
@@ -210,6 +243,10 @@ impl Default for Settings {
             colour_correction_gba: false, colour_correction_gb: false,
             colour_correction_gbc: false,
             bezel_gba: Bezel::None, bezel_gbc: Bezel::Default, bezel_gb: Bezel::Default,
+            aspect_gba: ScreenAspect::Full, aspect_gbc: ScreenAspect::Full,
+            aspect_gb: ScreenAspect::Full,
+            integer_gba: false, integer_gbc: false, integer_gb: false,
+            pad_map: Vec::new(),
             gb_palettes: false, gb_palette: 1, rewind: true,
             turbo: true, eject_save: true,
             show_fps: false, responsive_pacing: false,
@@ -276,6 +313,10 @@ impl Settings {
                 if !Shader::GB.contains(&s.shader_gb) { s.shader_gb = Shader::Off; }
                 if !Shader::GB.contains(&s.shader_gbc) { s.shader_gbc = Shader::Off; }
                 if s.gb_palette >= 48 { s.gb_palette = 1; }
+                if s.pad_map.len() != PAD_LOGICAL.len()
+                    || s.pad_map.iter().any(|p| !PAD_PHYSICAL.contains(p)) {
+                    s.pad_map.clear();
+                }
                 if !s.responsive_pacing { s.display_sync_pacing = false; }
                 if s.run_ahead_frames > 2 { s.run_ahead_frames = 0; }
                 // Before this version all three toggles defaulted ON.
@@ -348,7 +389,55 @@ impl Settings {
             slot_store::Platform::Gb=>self.bezel_gb=value,
         }
     }
+    pub fn aspect_for(&self,platform:slot_store::Platform)->ScreenAspect {
+        match platform {
+            slot_store::Platform::Gba=>self.aspect_gba,
+            slot_store::Platform::Gbc=>self.aspect_gbc,
+            slot_store::Platform::Gb=>self.aspect_gb,
+        }
+    }
+    pub fn integer_for(&self,platform:slot_store::Platform)->bool {
+        match platform {
+            slot_store::Platform::Gba=>self.integer_gba,
+            slot_store::Platform::Gbc=>self.integer_gbc,
+            slot_store::Platform::Gb=>self.integer_gb,
+        }
+    }
+    pub fn set_aspect_for(&mut self,platform:slot_store::Platform,value:ScreenAspect) {
+        match platform {
+            slot_store::Platform::Gba=>self.aspect_gba=value,
+            slot_store::Platform::Gbc=>self.aspect_gbc=value,
+            slot_store::Platform::Gb=>self.aspect_gb=value,
+        }
+    }
+    pub fn set_integer_for(&mut self,platform:slot_store::Platform,value:bool) {
+        match platform {
+            slot_store::Platform::Gba=>self.integer_gba=value,
+            slot_store::Platform::Gbc=>self.integer_gbc=value,
+            slot_store::Platform::Gb=>self.integer_gb=value,
+        }
+    }
+    /// Physical key currently bound to logical slot `index` (PAD_LOGICAL order).
+    pub fn pad_physical(&self,index:usize)->i32 {
+        if self.pad_map.len()==PAD_LOGICAL.len() { self.pad_map[index] }
+        else { PAD_LOGICAL[index] }
+    }
+    /// Bind `physical` to logical slot `index`, swapping with whichever slot
+    /// currently owns that key so nothing is left without a button.
+    pub fn pad_assign(&mut self,index:usize,physical:i32) {
+        if index>=PAD_LOGICAL.len() || !PAD_PHYSICAL.contains(&physical) { return; }
+        let mut map:Vec<i32>=if self.pad_map.len()==PAD_LOGICAL.len() {
+            self.pad_map.clone()
+        } else { PAD_LOGICAL.to_vec() };
+        let old=map[index];
+        if old==physical { return; }
+        if let Some(other)=map.iter().position(|&p|p==physical) { map[other]=old; }
+        map[index]=physical;
+        self.pad_map=if map==PAD_LOGICAL { Vec::new() } else { map };
+    }
+    pub fn pad_reset(&mut self) { self.pad_map.clear(); }
     // Screen: 0 GBA shader, 1 GB shader, 2 legacy GBA correction, 3 palettes.
+    // 29/30/31 aspect (GBA/GBC/GB), 32/33/34 integer scaling (GBA/GBC/GB).
     // 21 GBC shader, 22/23/24 independent corrections, 25/26/27 bezels.
     // Gameplay: keys 4..9.
     // Faithful to Slot quick_menu.rs except Date & Time (owned by Android).
@@ -367,6 +456,12 @@ impl Settings {
             25 => self.bezel_gba=self.bezel_gba.step(),
             26 => self.bezel_gbc=self.bezel_gbc.step(),
             27 => self.bezel_gb=self.bezel_gb.step(),
+            29 => self.aspect_gba=self.aspect_gba.step(),
+            30 => self.aspect_gbc=self.aspect_gbc.step(),
+            31 => self.aspect_gb=self.aspect_gb.step(),
+            32 => self.integer_gba=!self.integer_gba,
+            33 => self.integer_gbc=!self.integer_gbc,
+            34 => self.integer_gb=!self.integer_gb,
             3 => self.gb_palettes = !self.gb_palettes,
             4 => {
                 let at = SPEEDS.iter().position(|x| *x == self.ff_speed).unwrap_or(0);
